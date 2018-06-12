@@ -1,43 +1,120 @@
 package main
+
 import (
-	elastic "gopkg.in/olivere/elastic.v3"
+	"cloud.google.com/go/storage"
+	"context"
+	"encoding/json"
 	"fmt"
-      "net/http"
-      "encoding/json"
-	  "log"
-	  "strconv"
-	  "github.com/pborman/uuid"
-	  "reflect"
+	"github.com/pborman/uuid"
+	elastic "gopkg.in/olivere/elastic.v3"
+	"log"
+	"net/http"
+	"reflect"
+	"strconv"
+	"io"
 )
+
 type Location struct {
 	Lat float64 `json:"lat"`
 	Lon float64 `json:"lon"`
 }
 
 type Post struct {
-      // `json:"user"` is for the json parsing of this User field. Otherwise, by default it's 'User'.
-      User     string `json:"user"`
-      Message  string  `json:"message"`
-      Location Location `json:"location"`
+	// `json:"user"` is for the json parsing of this User field. Otherwise, by default it's 'User'.
+	User     string   `json:"user"`
+	Message  string   `json:"message"`
+	Location Location `json:"location"`
+	Url    string `json:"url"`
 }
 
 func handlerPost(w http.ResponseWriter, r *http.Request) {
-      // Parse from body of request to get a json object.
-      fmt.Println("Received one post request")
-      decoder := json.NewDecoder(r.Body)
-      var p Post
-      if err := decoder.Decode(&p); err != nil {
-             panic(err)
+	     w.Header().Set("Content-Type", "application/json")
+     w.Header().Set("Access-Control-Allow-Origin", "*")
+     w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+
+
+      // 32 << 20 is the maxMemory param for ParseMultipartForm, equals to 32MB (1MB = 1024 * 1024 bytes = 2^20 bytes)
+      // After you call ParseMultipartForm, the file will be saved in the server memory with maxMemory size.
+      // If the file size is larger than maxMemory, the rest of the data will be saved in a system temporary file.
+      r.ParseMultipartForm(32 << 20)
+
+      // Parse from form data.
+      fmt.Printf("Received one post request %s\n", r.FormValue("message"))
+      lat, _ := strconv.ParseFloat(r.FormValue("lat"), 64)
+      lon, _ := strconv.ParseFloat(r.FormValue("lon"), 64)
+      p := &Post{
+             User:    "1111",
+             Message: r.FormValue("message"),
+             Location: Location{
+                    Lat: lat,
+                    Lon: lon,
+             },
+      }
+
+      id := uuid.New()
+
+      file, _, err := r.FormFile("image")
+      if err != nil {
+             http.Error(w, "Image is not available", http.StatusInternalServerError)
+             fmt.Printf("Image is not available %v.\n", err)
              return
-	  }
-	  
-	  id := uuid.New()
+      }
+      defer file.Close()
+
+      ctx := context.Background()
+
+     // replace it with your real bucket name.
+      _, attrs, err := saveToGCS(ctx, file, BUCKET_NAME, id)
+      if err != nil {
+             http.Error(w, "GCS is not setup", http.StatusInternalServerError)
+             fmt.Printf("GCS is not setup %v\n", err)
+             return
+      }
+
+      // Update the media link after saving to GCS.
+      p.Url = attrs.MediaLink
+
       // Save to ES.
-      saveToES(&p, id)
+      saveToES(p, id)
 
+      // Save to BigTable.
+      //saveToBigTable(p, id)
 
-      fmt.Fprintf(w, "Post received: %s\n", p.Message)
 }
+
+func saveToGCS(ctx context.Context, r io.Reader, bucketName, name string) (*storage.ObjectHandle, *storage.ObjectAttrs, error) {
+     // Student questions
+  client, err := storage.NewClient(ctx)
+      if err != nil {
+             return nil, nil, err
+      }
+      defer client.Close()
+
+      bucket := client.Bucket(bucketName)
+      // Next check if the bucket exists
+      if _, err = bucket.Attrs(ctx); err != nil {
+             return nil, nil, err
+      }
+
+      obj := bucket.Object(name)
+      w := obj.NewWriter(ctx)
+      if _, err := io.Copy(w, r); err != nil {
+             return nil, nil, err
+      }
+      if err := w.Close(); err != nil {
+             return nil, nil, err
+      }
+
+      
+      if err := obj.ACL().Set(ctx, storage.AllUsers, storage.RoleReader); err != nil {
+             return nil, nil, err
+      }
+
+      attrs, err := obj.Attrs(ctx)
+      fmt.Printf("Post is saved to GCS: %s\n", attrs.MediaLink)
+      return obj, attrs, err
+}
+
 
 // Save a post to ElasticSearch
 func saveToES(p *Post, id string) {
@@ -64,24 +141,22 @@ func saveToES(p *Post, id string) {
 	fmt.Printf("Post is saved to Index: %s\n", p.Message)
 }
 
-
-
 func handlerSearch(w http.ResponseWriter, r *http.Request) {
 	lat, _ := strconv.ParseFloat(r.URL.Query().Get("lat"), 64)
 	lon, _ := strconv.ParseFloat(r.URL.Query().Get("lon"), 64)
-	// range is optional 
-	ran := DISTANCE 
-	if val := r.URL.Query().Get("range"); val != "" { 
-	   ran = val + "km" 
+	// range is optional
+	ran := DISTANCE
+	if val := r.URL.Query().Get("range"); val != "" {
+		ran = val + "km"
 	}
 
-	fmt.Printf( "Search received: %f %f %s\n", lat, lon, ran)
+	fmt.Printf("Search received: %f %f %s\n", lat, lon, ran)
 
 	// Create a client
 	client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
 	if err != nil {
-		   panic(err)
-		   return
+		panic(err)
+		return
 	}
 
 	// Define geo distance query as specified in
@@ -91,13 +166,13 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 
 	// Some delay may range from seconds to minutes. So if you don't get enough results. Try it later.
 	searchResult, err := client.Search().
-		   Index(INDEX).
-		   Query(q).
-		   Pretty(true).
-		   Do()
+		Index(INDEX).
+		Query(q).
+		Pretty(true).
+		Do()
 	if err != nil {
-		   // Handle error
-		   panic(err)
+		// Handle error
+		panic(err)
 	}
 
 	// searchResult is of type SearchResult and returns hits, suggestions,
@@ -112,36 +187,35 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 	var typ Post
 	var ps []Post
 	for _, item := range searchResult.Each(reflect.TypeOf(typ)) { // instance of
-		   p := item.(Post) // p = (Post) item
-		   fmt.Printf("Post by %s: %s at lat %v and lon %v\n", p.User, p.Message, p.Location.Lat, p.Location.Lon)
-		   // TODO(student homework): Perform filtering based on keywords such as web spam etc.
-		   ps = append(ps, p)
+		p := item.(Post) // p = (Post) item
+		fmt.Printf("Post by %s: %s at lat %v and lon %v\n", p.User, p.Message, p.Location.Lat, p.Location.Lon)
+		// TODO(student homework): Perform filtering based on keywords such as web spam etc.
+		ps = append(ps, p)
 
 	}
 	js, err := json.Marshal(ps)
 	if err != nil {
-		   panic(err)
-		   return
+		panic(err)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Write(js)
 
-
 }
 
 const (
-	INDEX = "around"
-	TYPE = "post"
+	INDEX    = "around"
+	TYPE     = "post"
 	DISTANCE = "200km"
 	// Needs to update
 	//PROJECT_ID = "around-xxx"
 	//BT_INSTANCE = "around-post"
 	// Needs to update this URL if you deploy it to cloud.
-	ES_URL = "http://35.237.35.50:9200"
+	ES_URL      = "http://35.196.159.6:9200"
+	BUCKET_NAME = "post-image-343240730592"
 )
-
 
 func main() {
 	// Create a client
@@ -176,8 +250,8 @@ func main() {
 		}
 	}
 
-	fmt.Print("started-service")	
-	http.HandleFunc("/post",handlerPost)
+	fmt.Print("started-service")
+	http.HandleFunc("/post", handlerPost)
 	http.HandleFunc("/search", handlerSearch)
-	log.Fatal(http.ListenAndServe(":8080",nil))
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
