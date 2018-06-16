@@ -248,7 +248,7 @@ const (
 	ES_URL      = "http://35.190.154.169:9200"
 	BUCKET_NAME = "post-image-343240730592"
 	PROJECT_ID  = "annular-net-206502"
-	BT_INSTANCE = "around-post"
+	BT_INSTANCE = "around-apt"
 )
 
 var mySigningKey = []byte("secret")
